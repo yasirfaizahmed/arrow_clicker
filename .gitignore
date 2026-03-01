@@ -2,4 +2,5 @@ custom_dataset
 .venv
 *.pt
 arrow_dataset
-.coco
+game arrows.coco
+__pycache__
