@@ -11,8 +11,8 @@ Behavior:
     - Captures webcam frames continuously
     - Detects arrows and sorts detections left-to-right
     - Converts detections into key sequence (left/right/up/down)
-    - Sends key presses once per unique on-screen pattern
-    - Will NOT resend the same sequence until camera pattern changes
+    - Re-checks the same sequence N times; sends only if stable
+    - Sleeps between cycles (default 1 second)
     - Does NOT open a display window
 """
 
@@ -20,16 +20,13 @@ from __future__ import annotations
 
 import argparse
 import time
-
+from pathlib import Path
 import cv2
 import pyautogui
 from ultralytics import YOLO
 
+DEFAULT_WEIGHTS = Path(r"C:\Users\user\Documents\arrow_clicker\best.pt")
 
-DEFAULT_WEIGHTS = (
-    "/home/xd/Documents/open_src/ComfyUI/runs/detect/runs/"
-    "arrow_yolov8n_coco_small/weights/best.pt"
-)
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--weights",
         type=str,
-        default=DEFAULT_WEIGHTS,
+        default=str(DEFAULT_WEIGHTS),
         help="Path to trained weights file (.pt)",
     )
     parser.add_argument("--camera", type=int, default=0, help="Webcam index")
@@ -51,8 +48,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--key-interval",
         type=float,
-        default=0.04,
-        help="Delay between key presses in a sent sequence",
+        default=0.25,
+        help="Delay between key presses in a sent sequence (seconds)",
+    )
+    parser.add_argument(
+        "--confirm-reads",
+        type=int,
+        default=2,
+        help="How many additional inferences must match before sending keys",
+    )
+    parser.add_argument(
+        "--cycle-sleep",
+        type=float,
+        default=1.0,
+        help="Sleep time between inference cycles (seconds)",
     )
     return parser.parse_args()
 
@@ -98,7 +107,14 @@ def main() -> None:
     # Move mouse to a corner to trigger fail-safe stop if needed.
     pyautogui.FAILSAFE = True
 
-    model = YOLO(args.weights)
+    weights_path = Path(args.weights)
+    if not weights_path.exists():
+        raise FileNotFoundError(
+            f"Weights file not found: {weights_path}\n"
+            "Tip: pass --weights C:/path/to/best.pt or update DEFAULT_WEIGHTS."
+        )
+
+    model = YOLO(str(weights_path))
     class_names = model.names if isinstance(model.names, dict) else {}
 
     print(f"Using weights: {args.weights}")
@@ -118,10 +134,6 @@ def main() -> None:
         )
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-
-    last_sent_sequence: tuple[str, ...] | None = None
-    prev_time = time.time()
-    last_print = prev_time
 
     print("Live inference started (headless).")
     print("No OpenCV window is shown. Stop with Ctrl+C.")
@@ -143,22 +155,36 @@ def main() -> None:
             result = results[0]
             sequence = extract_arrow_sequence(result, class_names)
 
-            if sequence:
-                if sequence != last_sent_sequence:
-                    print(f"SENT sequence: {sequence}")
-                    pyautogui.press(list(sequence), interval=args.key_interval)
-                    last_sent_sequence = sequence
+            confirmed = bool(sequence)
+            if confirmed:
+                for _ in range(max(args.confirm_reads, 0)):
+                    ok, verify_frame = cap.read()
+                    if not ok:
+                        confirmed = False
+                        break
 
-            now = time.time()
-            if now - last_print >= 1.0:
-                fps = 1.0 / max(now - prev_time, 1e-6)
-                prev_time = now
-                n = 0 if result.boxes is None else len(result.boxes)
-                print(
-                    f"fps={fps:.1f} detections={n} "
-                    f"last_sent={last_sent_sequence if last_sent_sequence else 'None'}"
-                )
-                last_print = now
+                    verify_results = model.predict(
+                        source=verify_frame,
+                        conf=float(args.conf),
+                        iou=args.iou,
+                        imgsz=args.imgsz,
+                        verbose=False,
+                    )
+                    verify_sequence = extract_arrow_sequence(
+                        verify_results[0],
+                        class_names,
+                    )
+                    if verify_sequence != sequence:
+                        confirmed = False
+                        break
+
+            if confirmed:
+                print(f"SENT sequence: {sequence}")
+                pyautogui.press(list(sequence), interval=args.key_interval)
+            else:
+                print("Sequence not stable; skipping send.")
+
+            time.sleep(args.cycle_sleep)
 
     except KeyboardInterrupt:
         print("\nStopped by user (Ctrl+C).")
