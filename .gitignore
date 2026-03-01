@@ -2,3 +2,4 @@ custom_dataset
 .venv
 *.pt
 arrow_dataset
+.coco
